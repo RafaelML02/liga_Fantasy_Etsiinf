@@ -110,6 +110,12 @@
     background: #f0fff4;
 }
 
+.btn-quitar-resultado {
+    border-color: #c0392b;
+    color: #c0392b;
+    background: #fff5f5;
+}
+
 .btn-editar-partido {
     border-color: #6c757d;
     color: #495057;

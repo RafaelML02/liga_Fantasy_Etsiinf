@@ -9,6 +9,7 @@ import java.util.List;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.TaskScheduler;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import com.ligainternaetsiinf.dto.EstadisticasPartidoResponse;
 import com.ligainternaetsiinf.dto.PartidoRequest;
@@ -41,6 +42,7 @@ public class PartidoService {
     @Autowired private EquipoFantasyService equipoFantasyService;
     @Autowired private AlineacionEquipoJornadaRepository alineacionRepository;
     @Autowired private TaskScheduler taskScheduler;
+    @Autowired private PuntosFantasyService puntosFantasyService;
 
     public PartidoResponse crearPartido(PartidoRequest request) {
         Equipo local = equipoRepository.findById(request.getEquipoLocalId())
@@ -77,6 +79,13 @@ public class PartidoService {
         validarEquiposEnJornada(request.getEquipoLocalId(), request.getEquipoVisitanteId(),
             request.getJornada(), id);
 
+        // Con resultado, cambiar equipos o jornada descuadraría los puntos ya repartidos
+        if (partido.isJugado() && (!partido.getEquipoLocal().getId().equals(local.getId())
+                || !partido.getEquipoVisitante().getId().equals(visitante.getId())
+                || !java.util.Objects.equals(partido.getJornada(), request.getJornada()))) {
+            throw new RuntimeException("Quita el resultado antes de cambiar los equipos o la jornada de este partido");
+        }
+
         partido.setEquipoLocal(local);
         partido.setEquipoVisitante(visitante);
         partido.setFecha(request.getFecha());
@@ -99,11 +108,17 @@ public class PartidoService {
         }
     }
 
+    @Transactional
     public void eliminarPartido(Integer id) {
-        if (!partidoRepository.existsById(id)) {
-            throw new RuntimeException("Partido no encontrado");
+        Partido partido = partidoRepository.findById(id)
+            .orElseThrow(() -> new RuntimeException("Partido no encontrado"));
+
+        // Deshacer todo lo que sumó su resultado antes de borrarlo
+        if (partido.isJugado()) {
+            revertirResultado(partido);
         }
-        partidoRepository.deleteById(id);
+        estadisticasRepository.deleteAll(estadisticasRepository.findByPartidoId(id));
+        partidoRepository.delete(partido);
     }
 
     public List<PartidoResponse> listarPartidos() {
@@ -120,62 +135,84 @@ public class PartidoService {
             .toList();
     }
 
+    /**
+     * Mete o corrige el resultado de un partido. Si ya tenía resultado, primero
+     * se resta todo lo que aportó (clasificación, estadísticas y puntos de los
+     * jugadores, puntos fantasy) y después se aplica el nuevo.
+     */
+    @Transactional
     public PartidoResponse registrarResultado(Integer id, ResultadoRequest request) {
         Partido partido = partidoRepository.findById(id)
             .orElseThrow(() -> new RuntimeException("Partido no encontrado"));
 
-        if (partido.isJugado()) {
-            throw new RuntimeException("Este partido ya tiene resultado registrado");
-        }
+        validarResultado(request);
 
-        partido.setGolesLocal(request.getGolesLocal());
-        partido.setGolesVisitante(request.getGolesVisitante());
+        if (partido.isJugado()) {
+            revertirResultado(partido);
+        }
+        aplicarResultado(partido, request);
+
+        return toResponse(partido);
+    }
+
+    /** Quita el resultado: el partido vuelve a "sin jugar" y se resta todo lo que sumó. */
+    @Transactional
+    public PartidoResponse quitarResultado(Integer id) {
+        Partido partido = partidoRepository.findById(id)
+            .orElseThrow(() -> new RuntimeException("Partido no encontrado"));
+        if (!partido.isJugado()) {
+            throw new RuntimeException("Este partido no tiene resultado");
+        }
+        revertirResultado(partido);
+        return toResponse(partido);
+    }
+
+    private void validarResultado(ResultadoRequest request) {
+        if (request.getGolesLocal() == null || request.getGolesVisitante() == null
+                || request.getGolesLocal() < 0 || request.getGolesVisitante() < 0) {
+            throw new RuntimeException("El marcador no es válido");
+        }
+        if (request.getEstadisticas() == null) return;
+        java.util.Set<Integer> vistos = new java.util.HashSet<>();
+        for (ResultadoRequest.EstadisticaJugadorRequest stat : request.getEstadisticas()) {
+            if (!stat.isJugo()) continue;
+            if (stat.getJugadorId() == null || !vistos.add(stat.getJugadorId())) {
+                throw new RuntimeException("Jugador repetido o sin id en las estadísticas");
+            }
+            if (stat.getGoles() < 0 || stat.getAsistencias() < 0 || stat.getTarjetasAmarillas() < 0
+                    || stat.getTarjetasRojas() < 0 || stat.getParadas() < 0) {
+                throw new RuntimeException("Las estadísticas no pueden ser negativas");
+            }
+        }
+    }
+
+    /** Suma el resultado: clasificación, estadísticas por jugador y puntos fantasy. */
+    private void aplicarResultado(Partido partido, ResultadoRequest request) {
+        int golesLocal = request.getGolesLocal();
+        int golesVisitante = request.getGolesVisitante();
+
+        partido.setGolesLocal(golesLocal);
+        partido.setGolesVisitante(golesVisitante);
         partido.setJugado(true);
         partidoRepository.save(partido);
 
+        actualizarClasificacion(partido.getEquipoLocal(), golesLocal, golesVisitante, +1);
+        actualizarClasificacion(partido.getEquipoVisitante(), golesVisitante, golesLocal, +1);
 
-        // Actualizar estadísticas del equipo local
-        Equipo equipoLocal = partido.getEquipoLocal();
-        equipoLocal.setGolesAFavor(equipoLocal.getGolesAFavor() + request.getGolesLocal());
-        equipoLocal.setGolesEnContra(equipoLocal.getGolesEnContra() + request.getGolesVisitante());
-        equipoLocal.setDiferenciaDeGoles(equipoLocal.getGolesAFavor() - equipoLocal.getGolesEnContra());
-        equipoLocal.setPartidosJugados(equipoLocal.getPartidosJugados() + 1);
-        if (request.getGolesLocal() > request.getGolesVisitante())
-            equipoLocal.setPuntos(equipoLocal.getPuntos() + 3);
-        else if (request.getGolesLocal().equals(request.getGolesVisitante()))
-            equipoLocal.setPuntos(equipoLocal.getPuntos() + 1);
-        equipoRepository.save(equipoLocal);
+        List<ResultadoRequest.EstadisticaJugadorRequest> estadisticas =
+            request.getEstadisticas() != null ? request.getEstadisticas() : List.of();
 
-        // Actualizar estadísticas del equipo visitante
-        Equipo equipoVisitante = partido.getEquipoVisitante();
-        equipoVisitante.setGolesAFavor(equipoVisitante.getGolesAFavor() + request.getGolesVisitante());
-        equipoVisitante.setGolesEnContra(equipoVisitante.getGolesEnContra() + request.getGolesLocal());
-        equipoVisitante.setDiferenciaDeGoles(equipoVisitante.getGolesAFavor() - equipoVisitante.getGolesEnContra());
-        equipoVisitante.setPartidosJugados(equipoVisitante.getPartidosJugados() + 1);
-        if (request.getGolesVisitante() > request.getGolesLocal())
-            equipoVisitante.setPuntos(equipoVisitante.getPuntos() + 3);
-        else if (request.getGolesVisitante().equals(request.getGolesLocal()))
-            equipoVisitante.setPuntos(equipoVisitante.getPuntos() + 1);
-        equipoRepository.save(equipoVisitante);
-
-
-
-        // Guardar estadísticas de cada jugador
-        for (ResultadoRequest.EstadisticaJugadorRequest stat : request.getEstadisticas()) {
+        for (ResultadoRequest.EstadisticaJugadorRequest stat : estadisticas) {
             if (!stat.isJugo()) continue;
 
             Jugador jugador = jugadorRepository.findById(stat.getJugadorId())
                 .orElseThrow(() -> new RuntimeException("Jugador no encontrado: " + stat.getJugadorId()));
 
-            
             String posicionUsada = (stat.getPosicionPartido() != null && !stat.getPosicionPartido().isBlank())
                 ? stat.getPosicionPartido()
                 : jugador.getPosicion();
-            // Calcular puntos de este jugador en este partido
-            int puntos = calcularPuntosJugador(posicionUsada, stat,
-                request.getGolesLocal(), request.getGolesVisitante(), partido);
+            int puntos = calcularPuntosJugador(posicionUsada, stat, golesLocal, golesVisitante, partido);
 
-            // Guardar/actualizar estadísticas del partido
             EstadisticasJugadorPartido estadistica = estadisticasRepository
                 .findByJugadorIdAndPartidoId(jugador.getId(), partido.getId())
                 .orElse(new EstadisticasJugadorPartido(jugador, partido));
@@ -190,21 +227,61 @@ public class PartidoService {
             estadistica.setPosicionJugada(posicionUsada);
             estadisticasRepository.save(estadistica);
 
-            // Actualizar estadísticas acumuladas del jugador real
-            jugador.setPuntosFantasy(jugador.getPuntosFantasy() + puntos);
-            jugador.setGoles(jugador.getGoles() + stat.getGoles());
-            jugador.setAsistencias(jugador.getAsistencias() + stat.getAsistencias());
-            jugador.setTarjetasAmarillas(jugador.getTarjetasAmarillas() + stat.getTarjetasAmarillas());
-            jugador.setTarjetasRojas(jugador.getTarjetasRojas() + stat.getTarjetasRojas());
-            jugador.setParadas(jugador.getParadas() + stat.getParadas());
-            jugador.setPartidosJugados(jugador.getPartidosJugados() + 1);
-            jugadorRepository.save(jugador);
+            actualizarAcumuladosJugador(jugador, estadistica, +1);
         }
 
-        // Otorgar puntos a los equipos fantasy que tenían alineados a estos jugadores
-        otorgarPuntosFantasy(partido);
+        // Puntos a los equipos fantasy con alineación ya registrada en esta jornada.
+        // Si la jornada aún no ha empezado, se sumarán al congelar las alineaciones.
+        puntosFantasyService.aplicarPartido(partido, +1);
+    }
 
-        return toResponse(partido);
+    /** Resta exactamente lo que sumó el resultado guardado y deja el partido sin jugar. */
+    private void revertirResultado(Partido partido) {
+        // Primero los puntos fantasy, mientras las estadísticas siguen guardadas
+        puntosFantasyService.aplicarPartido(partido, -1);
+
+        int golesLocal = partido.getGolesLocal() != null ? partido.getGolesLocal() : 0;
+        int golesVisitante = partido.getGolesVisitante() != null ? partido.getGolesVisitante() : 0;
+        actualizarClasificacion(partido.getEquipoLocal(), golesLocal, golesVisitante, -1);
+        actualizarClasificacion(partido.getEquipoVisitante(), golesVisitante, golesLocal, -1);
+
+        List<EstadisticasJugadorPartido> stats = estadisticasRepository.findByPartidoId(partido.getId());
+        for (EstadisticasJugadorPartido estadistica : stats) {
+            if (estadistica.isJugo()) {
+                Jugador jugador = estadistica.getJugador();
+                actualizarAcumuladosJugador(jugador, estadistica, -1);
+            }
+        }
+        estadisticasRepository.deleteAll(stats);
+        estadisticasRepository.flush();
+
+        partido.setGolesLocal(null);
+        partido.setGolesVisitante(null);
+        partido.setJugado(false);
+        partidoRepository.save(partido);
+    }
+
+    /** Suma (signo = +1) o resta (signo = -1) un partido a la clasificación de un equipo. */
+    private void actualizarClasificacion(Equipo equipo, int golesFavor, int golesContra, int signo) {
+        equipo.setGolesAFavor(equipo.getGolesAFavor() + signo * golesFavor);
+        equipo.setGolesEnContra(equipo.getGolesEnContra() + signo * golesContra);
+        equipo.setDiferenciaDeGoles(equipo.getGolesAFavor() - equipo.getGolesEnContra());
+        equipo.setPartidosJugados(equipo.getPartidosJugados() + signo);
+        int puntos = golesFavor > golesContra ? 3 : (golesFavor == golesContra ? 1 : 0);
+        equipo.setPuntos(equipo.getPuntos() + signo * puntos);
+        equipoRepository.save(equipo);
+    }
+
+    /** Suma (signo = +1) o resta (signo = -1) las estadísticas de un partido a los totales del jugador. */
+    private void actualizarAcumuladosJugador(Jugador jugador, EstadisticasJugadorPartido e, int signo) {
+        jugador.setPuntosFantasy(jugador.getPuntosFantasy() + signo * e.getPuntosObtenidos());
+        jugador.setGoles(jugador.getGoles() + signo * e.getGoles());
+        jugador.setAsistencias(jugador.getAsistencias() + signo * e.getAsistencias());
+        jugador.setTarjetasAmarillas(jugador.getTarjetasAmarillas() + signo * e.getTarjetasAmarillas());
+        jugador.setTarjetasRojas(jugador.getTarjetasRojas() + signo * e.getTarjetasRojas());
+        jugador.setParadas(jugador.getParadas() + signo * e.getParadas());
+        jugador.setPartidosJugados(jugador.getPartidosJugados() + signo);
+        jugadorRepository.save(jugador);
     }
 
     private int calcularPuntosJugador(String posicion,
@@ -265,42 +342,6 @@ public class PartidoService {
         return puntos; // puede ser negativo
     }
 
-    private void otorgarPuntosFantasy(Partido partido) {
-        Integer jornada = partido.getJornada();
-
-        // Obtener todas las alineaciones de esta jornada
-        List<AlineacionEquipoJornada> alineaciones = alineacionRepository.findByJornada(jornada);
-
-        for (AlineacionEquipoJornada alineacion : alineaciones) {
-            if (!alineacion.isPuntua()) continue;
-
-            EquipoFantasy equipo = alineacion.getEquipoFantasy();
-            int puntosJornada = 0;
-
-            for (JugadorFantasy jf : alineacion.getJugadoresAlineados()) {
-                Jugador jr = jf.getJugadorReal();
-                if (jr.getEquipo() == null) continue;
-
-                // ¿Jugó este jugador en este partido?
-                if (!jr.getEquipo().getId().equals(partido.getEquipoLocal().getId()) &&
-                    !jr.getEquipo().getId().equals(partido.getEquipoVisitante().getId())) {
-                    continue;
-                }
-
-                var stats = estadisticasRepository
-                    .findByJugadorIdAndPartidoId(jr.getId(), partido.getId());
-
-                if (stats.isPresent() && stats.get().isJugo()) {
-                    puntosJornada += stats.get().getPuntosObtenidos();
-                }
-            }
-
-            // Sumar puntos al equipo fantasy
-            equipo.setPuntos(equipo.getPuntos() + puntosJornada);
-            equipoFantasyRepository.save(equipo);
-        }
-    }
-
     // ─── Programar registro de alineaciones ──────────────────────────────────
     private void programarRegistroAlineaciones(Partido partido) {
         if (partido.getFecha() == null || partido.getJornada() == null) return;
@@ -333,7 +374,8 @@ public class PartidoService {
                 e.getJugador().getEquipo() != null ? e.getJugador().getEquipo().getName() : null,
                 e.getGoles(), e.getAsistencias(),
                 e.getTarjetasAmarillas(), e.getTarjetasRojas(),
-                e.getParadas(), e.isJugo()
+                e.getParadas(), e.isJugo(),
+                e.getPosicionJugada(), e.getPuntosObtenidos()
             ))
             .collect(java.util.stream.Collectors.toList());
     }

@@ -62,7 +62,14 @@ function renderizarJornadas() {
                        onclick="abrirModalResultado(${p.id},'${escapar(p.equipoLocalNombre)}','${escapar(p.equipoVisitanteNombre)}',${p.equipoLocalId},${p.equipoVisitanteId})">
                        ⚽ Resultado
                    </button>`
-                : '';
+                : `<button class="btn-partido-accion btn-resultado" title="Corregir marcador, jugadores o estadísticas"
+                       onclick="abrirModalResultado(${p.id},'${escapar(p.equipoLocalNombre)}','${escapar(p.equipoVisitanteNombre)}',${p.equipoLocalId},${p.equipoVisitanteId},true,${p.golesLocal},${p.golesVisitante})">
+                       ✏️ Editar resultado
+                   </button>
+                   <button class="btn-partido-accion btn-quitar-resultado" title="Deja el partido sin jugar y resta sus puntos"
+                       onclick="quitarResultado(${p.id})">
+                       ↩ Quitar resultado
+                   </button>`;
             return `
             <div class="partido-admin-card">
                 <div class="partido-equipos-admin">
@@ -227,23 +234,27 @@ async function guardarPartido() {
 }
 
 async function eliminarPartido(id) {
-    if (!confirm('¿Eliminar este partido?')) return;
+    if (!confirm('¿Eliminar este partido? Si tiene resultado, se restarán sus puntos.')) return;
     const res = await fetch(`/partidos/${id}`, { method: 'DELETE', credentials: 'include' });
     if (res.ok) cargarTodo();
     else alert('Error al eliminar.');
 }
 
 // ─── Modal resultado ──────────────────────────────────────────────────────────
-async function abrirModalResultado(partidoId, localNombre, visitanteNombre, localId, visitanteId) {
+let editandoResultado = false;
+
+async function abrirModalResultado(partidoId, localNombre, visitanteNombre, localId, visitanteId,
+                                   editar = false, golesLocalActual = 0, golesVisitanteActual = 0) {
+    editandoResultado = editar;
     console.log('abrirModalResultado llamado', partidoId, localNombre, visitanteNombre, localId, visitanteId);
     try {
         document.getElementById('resultado-partido-id').value = partidoId;
         document.getElementById('modal-resultado-titulo').textContent =
-            `Resultado: ${localNombre} vs ${visitanteNombre}`;
+            `${editar ? 'Editar resultado' : 'Resultado'}: ${localNombre} vs ${visitanteNombre}`;
         document.getElementById('resultado-local-nombre').textContent = localNombre;
         document.getElementById('resultado-visitante-nombre').textContent = visitanteNombre;
-        document.getElementById('goles-local').value = 0;
-        document.getElementById('goles-visitante').value = 0;
+        document.getElementById('goles-local').value = editar ? golesLocalActual : 0;
+        document.getElementById('goles-visitante').value = editar ? golesVisitanteActual : 0;
         document.getElementById('error-resultado').classList.add('hidden');
 
         const contenedor = document.getElementById('lista-jugadores-resultado');
@@ -273,6 +284,8 @@ async function abrirModalResultado(partidoId, localNombre, visitanteNombre, loca
 
         contenedor.innerHTML = renderizarJugadoresResultado(localNombre, jugLocal) +
                                renderizarJugadoresResultado(visitanteNombre, jugVis);
+
+        if (editar) await rellenarEstadisticasGuardadas(partidoId);
 
     } catch(e) {
         console.error('Error en abrirModalResultado:', e);
@@ -316,6 +329,48 @@ function renderizarJugadoresResultado(equipoNombre, jugadores) {
             Posición por defecto: ${j.posicion}. Cambia solo si jugó en otra posición.
         </div>
     `).join('')}`;
+}
+
+// Al editar, marca los jugadores que jugaron y carga sus estadísticas guardadas
+async function rellenarEstadisticasGuardadas(partidoId) {
+    const res = await fetch(`/partidos/${partidoId}/estadisticas`, { credentials: 'include' });
+    if (!res.ok) {
+        mostrarError('error-resultado', 'No se pudieron cargar las estadísticas guardadas.');
+        return;
+    }
+    const stats = await res.json();
+    const sinFila = [];
+    stats.forEach(e => {
+        const check = document.getElementById(`jugo-${e.jugadorId}`);
+        if (!check) { sinFila.push(e.jugadorNombre); return; }
+        check.checked = true;
+        toggleJugador(e.jugadorId);
+        document.getElementById(`goles-${e.jugadorId}`).value = e.goles;
+        document.getElementById(`asist-${e.jugadorId}`).value = e.asistencias;
+        document.getElementById(`amari-${e.jugadorId}`).value = e.tarjetasAmarillas;
+        document.getElementById(`rojas-${e.jugadorId}`).value = e.tarjetasRojas;
+        const select = document.getElementById(`pos-${e.jugadorId}`);
+        if (select && e.posicionJugada) select.value = e.posicionJugada;
+        actualizarVisibilidadParadas(e.jugadorId);
+        document.getElementById(`parad-${e.jugadorId}`).value = e.paradas;
+    });
+    if (sinFila.length > 0) {
+        mostrarError('error-resultado',
+            `Estos jugadores jugaron pero ya no están en ninguno de los dos equipos: ${sinFila.join(', ')}. ` +
+            'Si guardas, se quitarán sus estadísticas de este partido.');
+    }
+}
+
+async function quitarResultado(id) {
+    if (!confirm('¿Quitar el resultado? El partido quedará sin jugar y se restarán todos sus puntos y estadísticas.')) return;
+    mostrarCargando('Quitando resultado...');
+    try {
+        const res = await fetch(`/partidos/${id}/resultado`, { method: 'DELETE', credentials: 'include' });
+        if (!res.ok) { alert('Error: ' + await res.text()); return; }
+        cargarTodo();
+    } catch (e) {
+        alert('Error de conexión.');
+    } finally { ocultarCargando(); }
 }
 
 function toggleJugador(jugadorId) {
@@ -376,6 +431,7 @@ function confirmarResultado() {
     };
     const resumen = document.getElementById('resumen-confirmacion');
     resumen.innerHTML = `
+        ${editandoResultado ? '<strong>Se restarán los puntos del resultado anterior y se calcularán de nuevo.</strong><br>' : ''}
         <strong>Resultado:</strong>
         ${document.getElementById('resultado-local-nombre').textContent} ${golesLocal} –
         ${golesVis} ${document.getElementById('resultado-visitante-nombre').textContent}
@@ -410,7 +466,9 @@ async function ejecutarGuardarResultado() {
         cerrarModalResultado();
         resultadoPendiente = null;
         cargarTodo();
-        alert('✓ Resultado guardado y puntos otorgados correctamente.');
+        alert(editandoResultado
+            ? '✓ Resultado corregido y puntos recalculados.'
+            : '✓ Resultado guardado y puntos otorgados correctamente.');
     } catch (e) {
         alert('Error de conexión.');
     }

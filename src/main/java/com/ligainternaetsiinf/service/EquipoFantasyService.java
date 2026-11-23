@@ -51,6 +51,9 @@ public class EquipoFantasyService {
     private NoticiaFantasyService noticiaService;
 
     @Autowired
+    private PuntosFantasyService puntosFantasyService;
+
+    @Autowired
     private JugadorFantasyRepository jugadorFantasyRepository;
 
     @Autowired
@@ -339,6 +342,8 @@ public class EquipoFantasyService {
             );
             // setPuntua(true) es el valor por defecto
             alineacionRepository.save(registro);
+            // Si ya había partidos de esta jornada con resultado, sumar sus puntos ahora
+            puntosFantasyService.aplicarPartidosYaJugados(registro);
         }
     }
 

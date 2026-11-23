@@ -56,6 +56,12 @@ public class PartidoController {
         return partidoService.registrarResultado(id, request);
     }
 
+    @PreAuthorize("hasRole('ADMIN')")
+    @DeleteMapping("/{id}/resultado")
+    public PartidoResponse quitarResultado(@PathVariable Integer id) {
+        return partidoService.quitarResultado(id);
+    }
+
     @GetMapping("/{id}/estadisticas")
     public List<EstadisticasPartidoResponse> getEstadisticasPartido(@PathVariable Integer id) {
         return partidoService.getEstadisticasPartido(id);
